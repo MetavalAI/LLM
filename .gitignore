@@ -1,0 +1,9 @@
+venv/
+
+*.log
+
+*.env
+
+*.pdf
+
+*.xlsx

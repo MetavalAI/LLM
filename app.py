@@ -79,7 +79,7 @@ DOCUMENT PAGE TEXT:
 """
 
     response = ollama.chat(
-        model='qwen2.5:3b',
+        model='qwen2.5-coder:3b',
         messages=[{'role': 'user', 'content': prompt}],
         options={'temperature': 0.0}
     )

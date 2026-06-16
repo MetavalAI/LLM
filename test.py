@@ -5,192 +5,263 @@ import json
 import pandas as pd
 import ollama
 import argparse
-import os
 import logging
+import io
 
 
-# log file setup
-logging.basicConfig(
-    filename="error.log",   
-    level=logging.ERROR,    
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+SYNONYM_JSON = r"D:\Test\output.json" # change this as per the json location.
 
-# page se text nikalne ka function (OCR bhi karega agar zarurat hui toh)
+# LOGGING
+logging.basicConfig(filename="error.log", level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# SYNONYM FUNCTIONS
+def load_synonym_mapping(json_path):
+
+    with open(json_path, "r", encoding="utf-8") as f:data = json.load(f)
+
+    mapping = {}
+
+    for item in data:
+
+        canonical = item["canonical"]
+
+        for synonym in item["synonyms"]:
+            mapping[synonym.strip().lower()] = canonical
+
+    return mapping
+
+
+def normalize_fields(extracted_data, synonym_map):
+
+    normalized = {}
+
+    for key, value in extracted_data.items():
+
+        canonical_key = synonym_map.get(
+            key.strip().lower(),
+            key
+        )
+
+        normalized[canonical_key] = value
+
+    return normalized
+
+# VALIDATION layer
+EXPECTED_FIELDS = [
+    "Tag_Number",
+    "Service",
+    "Line_No.",
+    "Line_Size",
+    "Line_ID",
+    "Type_of_taps"
+]
+
+
+def validate_output(data):
+
+    for field in EXPECTED_FIELDS:
+
+        if field not in data:
+            data[field] = "NA"
+
+    return data
+
+# OCR
+OCR_READER = None
+
+def get_ocr_reader():
+
+    global OCR_READER
+
+    if OCR_READER is None:
+
+        import easyocr
+
+        OCR_READER = easyocr.Reader(['en'], gpu=False)
+
+    return OCR_READER
+
+# PDF TEXT EXTRACTION
 def extract_page_text(page, page_num):
-    """Ek single page ka text nikalta hai (agar scanned hai toh OCR karega)"""
+
     page_text = page.get_text()
-    # Agar text nahi mila, toh OCR lagayenge
-    if not page_text.strip():
-        print(f"   -> Page {page_num} scanned lag raha hai, OCR chal raha hai...")
-        try:
-            pix = page.get_pixmap(dpi=150)
-            import easyocr
-            import numpy as np
-            from PIL import Image
-            import io
 
-            reader = easyocr.Reader(['en'], gpu=False)
-            img_data = pix.tobytes("png")
-            image = Image.open(io.BytesIO(img_data))
+    if page_text.strip():
+        return page_text
 
-            bounds = reader.readtext(np.array(image), detail=0)
-            page_text = " ".join(bounds)
+    print(f"Page {page_num} scanned detected. OCR running...")
 
-        except ImportError:
-            error_msg = f"Page {page_num}: OCR ke liye easyocr install nahi hai."
-            print(f"   [ERROR] {error_msg}")
-            logging.error(error_msg)
-            page_text = ""
+    try:
 
-        except Exception as e:
-            error_msg = f"Page {page_num} par OCR fail ho gaya: {e}"
-            print(f"   [ERROR] {error_msg}")
-            logging.error(error_msg)
-            page_text = ""
+        pix = page.get_pixmap(dpi=200)
 
-    return page_text
+        import numpy as np
+        from PIL import Image
 
-# llm se data extract karne ka function
-def extract_fields_from_page(text, page_num):
-    """Ek single page ke text se JSON data nikalta hai"""
-    if not text.strip():
-        return None
+        img_data = pix.tobytes("png")
+
+        image = Image.open(io.BytesIO(img_data))
+
+        reader = get_ocr_reader()
+
+        text_list = reader.readtext(np.array(image), detail=0)
+
+        page_text = " ".join(text_list)
+
+        return page_text
+
+    except Exception as e:
+
+        logging.error(f"OCR Error Page {page_num}: {e}")
+
+        return ""
+
+# LLM EXTRACTION
+def extract_fields_from_document(text):
 
     prompt = f"""
-You are an expert engineering document extraction AI.
-Your job is to read the text of a SINGLE PAGE from a document and find specific fields.
+You are an engineering datasheet extraction system.
 
-Extract ONLY these fields and use them exactly as JSON keys:
-- Tag_Number
-- Service
-- Line_No.
-- Line_Size
-- Line_ID
-- Type_of_taps
+Extract ONLY these fields:
+
+Tag_Number
+Service
+Line_No.
+Line_Size
+Line_ID
+Type_of_taps
 
 RULES:
-1. Return ONLY a single valid JSON object for this page.
-2. Do not include markdown code blocks like ```json ... ```.
-3. No explanation, just raw JSON.
-4. If a field is missing, set its value to "NA".
-5. Extract data ONLY from the text provided below.
 
-DOCUMENT PAGE TEXT:
+1. Return ONLY valid JSON.
+2. No markdown.
+3. No explanation.
+4. Do not guess.
+5. If value is not explicitly found use "NA".
+6. Ignore revision history.
+7. Ignore page headers and footers.
+8. Extract values belonging to the main instrument.
+
+Return format:
+
+{{
+  "Tag_Number":"",
+  "Service":"",
+  "Line_No.":"",
+  "Line_Size":"",
+  "Line_ID":"",
+  "Type_of_taps":""
+}}
+
+DOCUMENT:
+
 {text}
 """
-
     response = ollama.chat(
-        model='gemma3:4b',
-        messages=[{'role': 'user', 'content': prompt}],
-        options={'temperature': 0.0}
-    )
+        model="gemma3:4b",
+        messages=[{"role": "user", "content": prompt}], options={"temperature": 0.0})
 
-    result = response['message']['content']
+    result = response["message"]["content"]
+
     result = result.replace("```json", "").replace("```", "").strip()
 
     try:
-        data = json.loads(result)
-    
-        data["Source_Page"] = f"Page {page_num}"
-        return data
 
-    except json.JSONDecodeError as e:
+        return json.loads(result)
 
-        error_msg = f"Page {page_num} ka LLM output valid JSON nahi hai. Error: {e}"
+    except Exception as e:
 
-        print(f"   [ERROR] {error_msg}")
-
-        logging.error(error_msg)
+        logging.error(
+            f"Invalid JSON from LLM: {e}"
+        )
 
         return {
-            "Tag_Number": "ERROR", "Service": "ERROR", "Line_No.": "ERROR", 
-            "Line_Size": "ERROR", "Line_ID": "ERROR", "Type_of_taps": "ERROR",
-            "Source_Page": f"Page {page_num}"
+            "Tag_Number": "ERROR",
+            "Service": "ERROR",
+            "Line_No.": "ERROR",
+            "Line_Size": "ERROR",
+            "Line_ID": "ERROR",
+            "Type_of_taps": "ERROR"
         }
 
-# Excel save karne ka function
-def save_excel(all_data_list, output_path):
+# SAVE EXCEL
+def save_excel(data, output_path):
 
-    try:
+    df = pd.DataFrame([data])
 
-        df = pd.DataFrame(all_data_list)
+    cols = [
+        "Tag_Number",
+        "Service",
+        "Line_No.",
+        "Line_Size",
+        "Line_ID",
+        "Type_of_taps"
+    ]
 
-        cols = [
-            "Source_Page",
-            "Tag_Number",
-            "Service",
-            "Line_No.",
-            "Line_Size",
-            "Line_ID",
-            "Type_of_taps"
-        ]
+    df = df.reindex(columns=cols)
 
-        df = df.reindex(columns=cols)
+    df.to_excel(
+        output_path,
+        index=False
+    )
 
-        df.to_excel(output_path, index=False)
-
-    except Exception as e:
-
-        error_msg = f"Excel save karte waqt error aaya: {e}"
-
-        print(f"[ERROR] {error_msg}")
-
-        logging.error(error_msg)
-        return
-
-# main function jo sab kuch coordinate karega
+# MAIN
 def main():
 
-    try:
-        parser = argparse.ArgumentParser()
-        parser.add_argument("-p", "--pdf_path", required=True)
-        parser.add_argument("-o", "--output", required=True)
-        args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--pdf_path", required=True)
+    parser.add_argument("-o", "--output", required=True)
+    args = parser.parse_args()
+    print("Loading synonym file...")
+    synonym_map = load_synonym_mapping(SYNONYM_JSON)
+    print("Opening PDF...")
+    doc = fitz.open(args.pdf_path)
+    total_pages = len(doc)
+    print(f"Pages Found: {total_pages}")
+    full_text = ""
 
-        print("\n[1/3] PDF File khol raha hoon...")
-        doc = fitz.open(args.pdf_path)
-        total_pages = len(doc)
-        print(f"Total Pages Mile: {total_pages}")
+    for i in range(total_pages):
 
-        all_extracted_rows = []
+        page_num = i + 1
 
-        # Loop jo har ek page par alag-alag chalega (Validation/Next Entry Rule)
-        for i in range(total_pages):
-            page_num = i + 1
-            print(f"\n--- Processing Page {page_num}/{total_pages} ---")
+        print(
+            f"Reading Page {page_num}/{total_pages}"
+        )
 
-            # Page text nikalenge
-            page_text = extract_page_text(doc[i], page_num)
+        page_text = extract_page_text(
+            doc[i],
+            page_num
+        )
 
-            # LLM ko bhejenge sirf isi page ka text
-            if page_text.strip():
-                print(f"   LLM ko bhej raha hoon Page {page_num} ka text...")
-                page_data = extract_fields_from_page(page_text, page_num)
-                if page_data:
-                    all_extracted_rows.append(page_data)
-                    print(f"   Data extracted: Tag -> {page_data.get('Tag_Number')}")
-            else:
-                error_msg = f"Page {page_num} khali mila."
-                print(f"   [Skip] {error_msg}")
-                logging.error(error_msg)
+        full_text += (
+            f"\n\n--- PAGE {page_num} ---\n\n"
+        )
 
-        if not all_extracted_rows:
-            print("\n[tagda error] Kisi bhi page se koi text ya data nahi mila. Bolo pencil extraction ho gya cancel.")
-            return
+        full_text += page_text
 
-        print("\n[2/3] Sabhi pages ka extracted data:")
-        print(json.dumps(all_extracted_rows, indent=4))
-        print("-----------------------------------")
+    if not full_text.strip():
 
-        print(f"\n[3/3] Excel me total {len(all_extracted_rows)} lines/entries save ho rhi hain...")
-        save_excel(all_extracted_rows, args.output)
-        print(f"Mubarak ho! Excel save ho gayi hai iss location pe: {args.output}\n")
+        print(
+            "No text found in PDF."
+        )
 
-    except Exception as e:
-        error_msg = f"Fatal Error: {e}"
-        print(f"\n[FATAL ERROR] {error_msg}")
-        logging.error(error_msg)
+        return
+
+    print("\nSending complete PDF to LLM...")
+
+    extracted_data = extract_fields_from_document(full_text)
+
+    extracted_data = normalize_fields(extracted_data, synonym_map)
+
+    extracted_data = validate_output(extracted_data)
+
+    print("\nExtracted Data:")
+
+    print(json.dumps(extracted_data, indent=4))
+
+    save_excel(extracted_data, args.output)
+
+    print(f"\nExcel saved at: {args.output}")
 
 
 if __name__ == "__main__":
@@ -200,3 +271,4 @@ if __name__ == "__main__":
 # python test.py -p "D:\Test\EI00362-DATA-OP.pdf" -o "D:\Test\output.xlsx"
 # "D:\Test\EI00362-DATA-OP.pdf"
 # "D:\Test\output.xlsx"
+# python -m py_compile test.py

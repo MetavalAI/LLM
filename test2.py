@@ -1,44 +1,56 @@
 # csv to  json
 
-
-
-
 import csv
 import json
 import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-i", "--input", required=True)
-parser.add_argument("-o", "--output", required=True)
 
-args = parser.parse_args()
+def csv_to_json(input_file, output_file):
+    result = []
 
-result = []
+    with open(input_file, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
 
-with open(args.input, newline="", encoding="utf-8") as f:
-    reader = csv.DictReader(f)
+        for row_number, row in enumerate(reader, start=1):
 
-    for row in reader:
-        synonyms = []
+            values = []
 
-        for value in row.values():
-            value = value.strip()
-            if value:
-                synonyms.append(value)
+            for cell in row:
+                cell = str(cell).strip()
 
-        if not synonyms:
-            continue
+                if cell:
+                    values.append(cell)
 
-        result.append({
-            "canonical": synonyms[0],  
-            "synonyms": list(dict.fromkeys(synonyms))  
-        })
+            if not values:
+                continue
 
-with open(args.output, "w", encoding="utf-8") as f:
-    json.dump(result, f, indent=2, ensure_ascii=False)
+            synonyms = list(dict.fromkeys(values))
 
-print(f"Saved {len(result)} records to {args.output}")
+            result.append(
+                {
+                    "canonical": synonyms[0],
+                    "synonyms": synonyms
+                }
+            )
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    print(f"\n save kr diye h, {len(result)} entries mile h or ab, iss file me: {output_file} save kr di h.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="csv se json me convert karo (ye sirf iss particualr csv ke iye bna h).")
+
+    parser.add_argument("-i", "--input", required=True, help="csv ka file path de yha pa")
+
+    parser.add_argument("-o", "--output", default="output.json", help="json output file ka path de yha pe")
+
+    args = parser.parse_args()
+
+    csv_to_json(args.input, args.output)
 
 
 # python test2.py -i "D:\Test\keywords-28.01.2026.csv"
-# python test2.py -i "D:\Test\keywords-28.01.2026.csv" -o output.json
+# python test2.py -i "D:\Test\keywords-28.01.2026.csv" -o "output.json"
+# python -m py_compile test2.py

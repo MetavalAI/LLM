@@ -1,87 +1,159 @@
 # machine 2
+import os
+import json
+import io
+import fitz
+import ollama
+import easyocr
+import numpy as np
+from PIL import Image
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import fitz, json, os, ollama, easyocr, numpy as np, io
-from PIL import Image
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="MetaVal LLM Extraction Engine")
+app = FastAPI(title="MetaVal Dynamic LLM Extraction Engine")
+
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load OCR only once globally
 reader = easyocr.Reader(['en'], gpu=False)
 
-# 1. Define the exact JSON structure Node.js will send
+# 1. 100% Dynamic Schema: Node.js se file_path aur mapping_data dono aayenge
 class DocumentRequest(BaseModel):
     file_path: str
+    mapping_data: dict = {}  # Ye Node.js ka buildDynamicMappingPayload() bhejega
 
 @app.post("/extract")
 async def extract_data(request: DocumentRequest):
+    # Fix the slash issue for Windows UNC Network Paths
     file_path = request.file_path
+    mapping_data = request.mapping_data
+    
     print(f"\n⚙️ [Machine 2] Request received to parse: {file_path}")
+
+    # DEBUG
+    print("=" * 60)
+    print("Received Path:", file_path)
+    print("Exists:", os.path.exists(file_path))
+    print("=" * 60)
     
-    # 2. Safety Check: Ensure the file dropped by OneDrive actually exists
+    if not mapping_data:
+        print("⚠️ [Warning] No mapping_data received from Node.js! Output might be generic.")
+    else:
+        print(f"📋 [Machine 2] Dynamic Mapping Loaded for {len(mapping_data.keys())} fields.")
+
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk")
+        raise HTTPException(status_code=404, detail=f"File not found on network: {file_path}")
+
+    # ==========================================
+    # 🧠 DYNAMIC PROMPT BUILDER
+    # ==========================================
+    # Node.js ke bheje gaye keywords aur dropdowns se hum LLM ke liye rules banayenge
+    schema_instructions = {}
+    for target_key, config in mapping_data.items():
+        aliases = config.get("aliases", [])
+        dropdowns = config.get("dropdowns", [])
         
-    # We define the specific fields Node.js PostgreSQL database expects
-    allowed_fields = ["doc_no", "rev", "item_description", "fluid_state"]
-    results = []
-    
-    # 3. Dynamic System Prompt
+        instruction = "Extract this value."
+        if aliases:
+            instruction += f" In the document, it might be called: {', '.join(aliases)}."
+        if dropdowns:
+            instruction += f" IMPORTANT: Your output MUST strictly match exactly one of these allowed options: {dropdowns}. If it doesn't match, return null."
+            
+        schema_instructions[target_key] = instruction
+
+    # Convert the required schema into strings for the LLM
+    schema_json_str = json.dumps(schema_instructions, indent=2)
+    expected_format = json.dumps({"data": [{k: "..." for k in mapping_data.keys()}]}, indent=2)
+
     system_prompt = f"""
-    Tu ek expert engineering data sheet parser hai. PDF se technical specs nikal.
-    1. Document Number ya Tag Number dhoond.
-    2. Ye specific fields extract kar: {', '.join(allowed_fields)}.
-    3. Agar field nahi milti to 'NA' likh.
-    4. Strict JSON format mein output de.
-    Structure: {{"data": [{{"doc_no": "...", "rev": "...", "item_description": "...", "fluid_state": "..."}}]}}
+    You are an expert industrial document parser. Extract technical specifications from the provided OCR text.
+    
+    You MUST extract ONLY the following fields based on their aliases and strict dropdown constraints:
+    {schema_json_str}
+    
+    RULES:
+    1. If a field has a dropdown list, you MUST pick an exact match from that list. Do not invent words.
+    2. If a field is missing from the text, return null for that field.
+    3. Output MUST be valid JSON format only without any conversational text or markdown.
+    
+    Output Structure MUST look exactly like this:
+    {expected_format}
     """
+
+    results = []
     
     try:
         print("🧠 [Machine 2] Booting LLM inference...")
         doc = fitz.open(file_path)
         
-        # 4. Process each page (Text first, OCR as fallback)
+        # 3. Process each page
         for idx, page in enumerate(doc):
             text = page.get_text().strip()
             
-            # If no selectable text, trigger EasyOCR
+            # Trigger OCR if text is not selectable
             if not text:
                 pix = page.get_pixmap(dpi=150)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
                 text = " ".join(reader.readtext(np.array(img), detail=0))
             
-            # 5. Send to Ollama (Gemma 3)
+            if not text.strip():
+                continue
+            
+            # Send to Ollama (Gemma 3)
             response = ollama.chat(model='gemma3:4b', messages=[
                 {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': f"Extract data:\n{text}"}
-            ], options={'temperature': 0.0})
+                {'role': 'user', 'content': f"Document Text:\n{text}"}
+            ], options={'temperature': 0.0}) # Temperature 0 = Strict Accuracy
             
-            # Clean and parse JSON response
-            content = response['message']['content'].replace('```json', '').replace('```', '')
-            data = json.loads(content)
-            print(f"📊 [DATA EXTRACTED PAGE {idx+1}]: {json.dumps(data, indent=2)}")
+            # Clean JSON response
+            content = response['message']['content'].strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.endswith("```"):
+                content = content[:-3]
             
-            # 6. Normalize data for Node.js
-            for item in data.get("data", []):
-                clean_row = {
-                    "doc_no": str(item.get("doc_no", "UNKNOWN")).strip().upper(),
-                    "rev": str(item.get("rev", "0")).strip(),
-                    "item_description": str(item.get("item_description", "NA")).strip(),
-                    "fluid_state": str(item.get("fluid_state", "NA")).strip()
-                }
-                results.append(clean_row)
+            try:
+                data = json.loads(content.strip())
+                page_rows = data.get("data", [])
+                
+                if isinstance(page_rows, dict):
+                    page_rows = [page_rows]
+                
+                print(f"📊 [DATA EXTRACTED PAGE {idx+1}]: {json.dumps(page_rows, indent=2)}")
+                
+                # 4. Filter only the requested dynamic keys
+                for row in page_rows:
+                    clean_row = {}
+                    for target_key in mapping_data.keys():
+                        clean_row[target_key] = row.get(target_key, None)
+                    results.append(clean_row)
+                    
+            except json.JSONDecodeError:
+                print(f"⚠️ [Machine 2] JSON Parsing failed on page {idx+1}. Raw output: {content}")
 
         doc.close()
         
-        # Grab the first extracted item to send back to Node.js
-        final_data = results[0] if results else {"doc_no": "UNKNOWN", "rev": "0", "item_description": "NA", "fluid_state": "NA"}
+        print(f"✅ [Machine 2] Extraction successful! Total rows extracted: {len(results)}")
         
-        print(f"✅ [Machine 2] Extraction successful! Sending back to Node.js...")
-        
-        # Node expects response.data.data
-        return {"status": "success", "data": final_data}
+        # Return exact structure expected by Node.js
+        return {"status": "success", "data": results}
         
     except Exception as e:
         print(f"❌ [Machine 2] Extraction Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Dynamic MetaVal Python Engine...")
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 
 
 

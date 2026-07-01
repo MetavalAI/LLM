@@ -14,3 +14,11 @@ __pycache__/
 *.csv
 
 *.json
+
+*.ipynb
+
+output/
+
+*.sql
+
+Extras/
